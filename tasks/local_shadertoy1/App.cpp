@@ -37,6 +37,9 @@ App::App()
       .physicalDeviceIndexOverride = {},
       .numFramesInFlight = 1,
     });
+
+
+    context = &etna::get_context();
   }
 
   // Next, we need a magical Etna helper to send commands to the GPU.
@@ -75,6 +78,15 @@ App::App()
   }
 
   // TODO: Initialize any additional resources you require here!
+  etna::create_program("toy", {LOCAL_SHADERTOY1_SHADERS_ROOT "toy.comp.spv"});
+  pipeline = context->getPipelineManager().createComputePipeline("toy", {});
+
+  computeTarget = context->createImage(etna::Image::CreateInfo{
+      .extent = vk::Extent3D{resolution.x, resolution.y, 1},
+      .name = "compute_target",
+      .format = vk::Format::eR8G8B8A8Unorm,
+      .imageUsage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
+  });
 }
 
 App::~App()
@@ -122,25 +134,96 @@ void App::drawFrame()
       // "Transfer" in vulkanese means "copy or blit".
       // Note that Etna sometimes calls this for you to make life simpler, read Etna's code!
       etna::set_state(
-        currentCmdBuf,
-        backbuffer,
-        // We are going to use the texture at the transfer stage...
-        vk::PipelineStageFlagBits2::eTransfer,
-        // ...to transfer-write stuff into it...
-        vk::AccessFlagBits2::eTransferWrite,
-        // ...and want it to have the appropriate layout.
-        vk::ImageLayout::eTransferDstOptimal,
-        vk::ImageAspectFlagBits::eColor);
+          currentCmdBuf, backbuffer,
+          vk::PipelineStageFlagBits2::eTransfer,
+          vk::AccessFlagBits2::eTransferWrite,
+          vk::ImageLayout::eTransferDstOptimal,
+          vk::ImageAspectFlagBits::eColor);
+      etna::flush_barriers(currentCmdBuf);
       // The set_state doesn't actually record any commands, they are deferred to
       // the moment you call flush_barriers.
       // As with set_state, Etna sometimes flushes on it's own.
       // Usually, flushes should be placed before "action", i.e. compute dispatches
       // and blit/copy operations.
-      etna::flush_barriers(currentCmdBuf);
 
 
       // TODO: Record your commands here!
 
+      currentCmdBuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.getVkPipeline());
+
+      auto shaderInfo = etna::get_shader_program("toy");
+      auto set = etna::create_descriptor_set(
+          shaderInfo.getDescriptorLayoutId(0),
+          currentCmdBuf,
+          {
+              etna::Binding{0, computeTarget.genBinding(vk::Sampler{}, vk::ImageLayout::eGeneral)}
+          });
+
+      vk::DescriptorSet vkSet = set.getVkSet();
+      currentCmdBuf.bindDescriptorSets(
+          vk::PipelineBindPoint::eCompute,
+          pipeline.getVkPipelineLayout(),
+          0, 1, &vkSet, 0, nullptr);
+      
+    struct PushConstants
+    {
+        glm::vec4 time_res;
+    };
+
+    PushConstants pc{
+        glm::vec4{
+            static_cast<float>(windowing.getTime()),
+            static_cast<float>(resolution.x),
+            static_cast<float>(resolution.y),
+            0.0f
+        }
+    };
+
+    currentCmdBuf.pushConstants(
+        pipeline.getVkPipelineLayout(),
+        vk::ShaderStageFlagBits::eCompute,
+        0,
+        sizeof(PushConstants),
+    &pc);
+
+      etna::set_state(
+        currentCmdBuf, computeTarget.get(),
+        vk::PipelineStageFlagBits2::eComputeShader,
+        vk::AccessFlagBits2::eShaderWrite,
+        vk::ImageLayout::eGeneral,
+        vk::ImageAspectFlagBits::eColor);
+      etna::flush_barriers(currentCmdBuf);
+
+      uint32_t gx = (resolution.x + 31) / 32;
+      uint32_t gy = (resolution.y + 31) / 32;
+      currentCmdBuf.dispatch(gx, gy, 1);
+
+      etna::set_state(
+        currentCmdBuf, computeTarget.get(),
+        vk::PipelineStageFlagBits2::eTransfer,
+        vk::AccessFlagBits2::eTransferRead,
+        vk::ImageLayout::eTransferSrcOptimal,
+        vk::ImageAspectFlagBits::eColor);
+
+      etna::flush_barriers(currentCmdBuf);
+
+      vk::ImageBlit blit{};
+      blit.srcSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+      blit.srcSubresource.layerCount = 1;
+      blit.srcOffsets[0] = vk::Offset3D{0, 0, 0};
+      blit.srcOffsets[1] = vk::Offset3D{
+          static_cast<int32_t>(resolution.x), static_cast<int32_t>(resolution.y), 1};
+
+      blit.dstSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+      blit.dstSubresource.layerCount = 1;
+      blit.dstOffsets[0] = vk::Offset3D{0, 0, 0};
+      blit.dstOffsets[1] = vk::Offset3D{
+          static_cast<int32_t>(resolution.x), static_cast<int32_t>(resolution.y), 1};
+
+      currentCmdBuf.blitImage(
+          computeTarget.get(), vk::ImageLayout::eTransferSrcOptimal,
+          backbuffer,          vk::ImageLayout::eTransferDstOptimal,
+          1, &blit, vk::Filter::eLinear);
 
       // At the end of "rendering", we are required to change how the pixels of the
       // swpchain image are laid out in memory to something that is appropriate
