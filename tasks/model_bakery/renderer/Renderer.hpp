@@ -9,6 +9,7 @@
 
 #include "FramePacket.hpp"
 #include "WorldRenderer.hpp"
+#include "gui/ImGuiRenderer.hpp"
 
 
 using ResolutionProvider = fu2::unique_function<glm::uvec2() const>;
@@ -21,12 +22,11 @@ public:
 
   void initVulkan(std::span<const char*> instance_extensions);
   void initFrameDelivery(vk::UniqueSurfaceKHR surface, ResolutionProvider res_provider);
-  void recreateSwapchain(glm::uvec2 res);
-  void loadScene(std::filesystem::path path);
 
   void debugInput(const Keyboard& kb);
   void update(const FramePacket& packet);
   void drawFrame();
+  bool isBenchmarkDone() const { return worldRenderer->isBenchmarkDone(); }
 
 private:
   ResolutionProvider resolutionProvider;
@@ -38,4 +38,5 @@ private:
   bool useVsync = true;
 
   std::unique_ptr<WorldRenderer> worldRenderer;
+  std::unique_ptr<ImGuiRenderer> guiRenderer;
 };

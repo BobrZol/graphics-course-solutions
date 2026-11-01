@@ -6,18 +6,15 @@
 #include <etna/GraphicsPipeline.hpp>
 #include <glm/glm.hpp>
 
-#include "scene/SceneManager.hpp"
 #include "wsi/Keyboard.hpp"
-
 #include "FramePacket.hpp"
+#include "RockRenderer.hpp"
 
 
 class WorldRenderer
 {
 public:
   WorldRenderer();
-
-  void loadScene(std::filesystem::path path);
 
   void loadShaders();
   void allocateResources(glm::uvec2 swapchain_resolution);
@@ -26,30 +23,46 @@ public:
   void debugInput(const Keyboard& kb);
   void update(const FramePacket& packet);
   void drawGui();
+  void prepareFrame();
+  bool isBenchmarkDone() const { return rocks.isBenchmarkDone(); }
   void renderWorld(
     vk::CommandBuffer cmd_buf, vk::Image target_image, vk::ImageView target_image_view);
 
 private:
-  void renderScene(
-    vk::CommandBuffer cmd_buf, const glm::mat4x4& glob_tm, vk::PipelineLayout pipeline_layout);
+  void generateHeightmap(vk::CommandBuffer cmd_buf);
 
-
-private:
-  std::unique_ptr<SceneManager> sceneMgr;
+  RockRenderer rocks;
+  std::vector<float> heightValues;
 
   etna::Image mainViewDepth;
-  etna::Buffer constants;
+  etna::Image heightmap;
+  etna::Image albedoMaps;
+  etna::Image roughnessMaps;
+  etna::Image detailMaps;
+  etna::Sampler heightSampler;
+  etna::Sampler materialSampler;
+  etna::Buffer indices;
 
   struct PushConstants
   {
-    glm::mat4x4 projView;
-    glm::mat4x4 model;
-  } pushConst2M;
+    glm::mat4 projView{1};
+    glm::vec4 cameraExposure{0, 0, 0, 1.2f};
+    glm::vec4 terrainSettings{256, 75, 32, 0.25f};
+    glm::vec4 sun{0, 1, 0, 3.5f};
+    glm::vec4 light{1, 0.95f, 0.85f, 0.25f};
+  } params;
 
-  glm::mat4x4 worldViewProj;
-  glm::mat4x4 lightMatrix;
+  struct NoiseParams
+  {
+    glm::vec4 noise{4, 0.5f, 2, 6};
+    glm::vec4 island{0.95f, 0.55f, 1.4f, 7};
+  } noiseParams;
 
-  etna::GraphicsPipeline staticMeshPipeline{};
-
-  glm::uvec2 resolution;
+  float sunAzimuth = 135;
+  float sunElevation = 45;
+  bool heightmapDirty = true;
+  bool outputSrgb = true;
+  etna::GraphicsPipeline terrainPipeline{};
+  etna::GraphicsPipeline heightmapPipeline{};
+  glm::uvec2 resolution{};
 };

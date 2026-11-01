@@ -1,39 +1,28 @@
 #version 450
-#extension GL_ARB_separate_shader_objects : enable
 #extension GL_GOOGLE_include_directive : require
 
-#include "unpack_attributes.glsl"
+#include "terrain_params.glsl"
 
+layout(location = 0) out vec3 worldPosition;
+layout(location = 1) out vec2 terrainUV;
 
-layout(location = 0) in vec4 vPosNorm;
-layout(location = 1) in vec4 vTexCoordAndTang;
-
-layout(push_constant) uniform params_t
+void main()
 {
-  mat4 mProjView;
-  mat4 mModel;
-} params;
-
-
-layout (location = 0 ) out VS_OUT
-{
-  vec3 wPos;
-  vec3 wNorm;
-  vec3 wTangent;
-  vec2 texCoord;
-} vOut;
-
-out gl_PerVertex { vec4 gl_Position; };
-
-void main(void)
-{
-  const vec4 wNorm = vec4(decode_normal(floatBitsToInt(vPosNorm.w)),     0.0f);
-  const vec4 wTang = vec4(decode_normal(floatBitsToInt(vTexCoordAndTang.z)), 0.0f);
-
-  vOut.wPos   = (params.mModel * vec4(vPosNorm.xyz, 1.0f)).xyz;
-  vOut.wNorm  = normalize(mat3(transpose(inverse(params.mModel))) * wNorm.xyz);
-  vOut.wTangent = normalize(mat3(transpose(inverse(params.mModel))) * wTang.xyz);
-  vOut.texCoord = vTexCoordAndTang.xy;
-
-  gl_Position   = params.mProjView * vec4(vOut.wPos, 1.0);
+  if (params.terrain.y < 0.0)
+  {
+    const vec2 corners[6] = vec2[6](
+      vec2(-1, -1), vec2(-1, 1), vec2(1, -1),
+      vec2(1, -1), vec2(-1, 1), vec2(1, 1));
+    vec2 p = corners[gl_VertexIndex] * params.terrain.x * 20.0;
+    terrainUV = p / params.terrain.x + 0.5;
+    worldPosition = vec3(p.x, 0.0, p.y);
+  }
+  else
+  {
+    terrainUV = vec2(gl_VertexIndex % 257, gl_VertexIndex / 257) / 256.0;
+    float height = textureLod(heightmap, heightUV(terrainUV), 0.0).r * params.terrain.y;
+    vec2 p = (terrainUV - 0.5) * params.terrain.x;
+    worldPosition = vec3(p.x, height, p.y);
+  }
+  gl_Position = params.projView * vec4(worldPosition, 1.0);
 }

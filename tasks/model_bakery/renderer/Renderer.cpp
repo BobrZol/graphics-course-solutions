@@ -5,11 +5,14 @@
 #include <etna/RenderTargetStates.hpp>
 #include <etna/PipelineManager.hpp>
 #include <etna/Profiling.hpp>
+#include <imgui.h>
+#include <cstdlib>
 
 
 Renderer::Renderer(glm::uvec2 res)
   : resolution{res}
 {
+  useVsync = std::getenv("ROCK_BENCHMARK") == nullptr;
 }
 
 void Renderer::initVulkan(std::span<const char*> instance_extensions)
@@ -24,7 +27,7 @@ void Renderer::initVulkan(std::span<const char*> instance_extensions)
   deviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 
   etna::initialize(etna::InitParams{
-    .applicationName = "model_bakery_renderer",
+    .applicationName = "terrain",
     .applicationVersion = VK_MAKE_VERSION(0, 1, 0),
     .instanceExtensions = instanceExtensions,
     .deviceExtensions = deviceExtensions,
@@ -59,11 +62,7 @@ void Renderer::initFrameDelivery(vk::UniqueSurfaceKHR a_surface, ResolutionProvi
   worldRenderer->allocateResources(resolution);
   worldRenderer->loadShaders();
   worldRenderer->setupPipelines(window->getCurrentFormat());
-}
-
-void Renderer::loadScene(std::filesystem::path path)
-{
-  worldRenderer->loadScene(path);
+  guiRenderer = std::make_unique<ImGuiRenderer>(window->getCurrentFormat());
 }
 
 void Renderer::debugInput(const Keyboard& kb)
@@ -73,7 +72,7 @@ void Renderer::debugInput(const Keyboard& kb)
   if (kb[KeyboardKey::kB] == ButtonState::Falling)
   {
     const int retval = std::system("cd " GRAPHICS_COURSE_ROOT "/build"
-                                   " && cmake --build . --target model_bakery_renderer_shaders");
+                                   " && cmake --build . --target terrain_shaders");
     if (retval != 0)
       spdlog::warn("Shader recompilation returned a non-zero return code!");
     else
@@ -94,6 +93,11 @@ void Renderer::drawFrame()
 {
   ZoneScoped;
 
+  guiRenderer->nextFrame();
+  ImGui::NewFrame();
+  worldRenderer->drawGui();
+  ImGui::Render();
+
   auto currentCmdBuf = commandManager->acquireNext();
 
   etna::begin_frame();
@@ -104,11 +108,15 @@ void Renderer::drawFrame()
   {
     auto [image, view, availableSem, readyForPresentSem] = *nextSwapchainImage;
 
+    worldRenderer->prepareFrame();
+
     ETNA_CHECK_VK_RESULT(currentCmdBuf.begin(vk::CommandBufferBeginInfo{}));
     {
       ETNA_PROFILE_GPU(currentCmdBuf, renderFrame);
 
       worldRenderer->renderWorld(currentCmdBuf, image, view);
+      guiRenderer->render(
+        currentCmdBuf, {{0, 0}, {resolution.x, resolution.y}}, image, view, ImGui::GetDrawData());
 
       etna::set_state(
         currentCmdBuf,
