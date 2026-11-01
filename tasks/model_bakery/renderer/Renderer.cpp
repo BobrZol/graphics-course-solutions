@@ -6,11 +6,13 @@
 #include <etna/PipelineManager.hpp>
 #include <etna/Profiling.hpp>
 #include <imgui.h>
+#include <cstdlib>
 
 
 Renderer::Renderer(glm::uvec2 res)
   : resolution{res}
 {
+  useVsync = std::getenv("ROCK_BENCHMARK") == nullptr;
 }
 
 void Renderer::initVulkan(std::span<const char*> instance_extensions)
@@ -105,6 +107,8 @@ void Renderer::drawFrame()
   if (nextSwapchainImage)
   {
     auto [image, view, availableSem, readyForPresentSem] = *nextSwapchainImage;
+
+    worldRenderer->prepareFrame();
 
     ETNA_CHECK_VK_RESULT(currentCmdBuf.begin(vk::CommandBufferBeginInfo{}));
     {

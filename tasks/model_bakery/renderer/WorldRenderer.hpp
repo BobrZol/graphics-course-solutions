@@ -8,6 +8,7 @@
 
 #include "wsi/Keyboard.hpp"
 #include "FramePacket.hpp"
+#include "RockRenderer.hpp"
 
 
 class WorldRenderer
@@ -22,11 +23,16 @@ public:
   void debugInput(const Keyboard& kb);
   void update(const FramePacket& packet);
   void drawGui();
+  void prepareFrame();
+  bool isBenchmarkDone() const { return rocks.isBenchmarkDone(); }
   void renderWorld(
     vk::CommandBuffer cmd_buf, vk::Image target_image, vk::ImageView target_image_view);
 
 private:
   void generateHeightmap(vk::CommandBuffer cmd_buf);
+
+  RockRenderer rocks;
+  std::vector<float> heightValues;
 
   etna::Image mainViewDepth;
   etna::Image heightmap;

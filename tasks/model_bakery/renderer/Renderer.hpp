@@ -26,6 +26,7 @@ public:
   void debugInput(const Keyboard& kb);
   void update(const FramePacket& packet);
   void drawFrame();
+  bool isBenchmarkDone() const { return worldRenderer->isBenchmarkDone(); }
 
 private:
   ResolutionProvider resolutionProvider;

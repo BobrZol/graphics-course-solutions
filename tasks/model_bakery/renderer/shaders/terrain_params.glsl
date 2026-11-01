@@ -1,11 +1,4 @@
-layout(push_constant) uniform TerrainParams
-{
-  mat4 projView;
-  vec4 cameraExposure;
-  vec4 terrain;
-  vec4 sun;
-  vec4 light;
-} params;
+#include "scene_params.glsl"
 
 layout(set = 0, binding = 0) uniform sampler2D heightmap;
 

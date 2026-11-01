@@ -3,6 +3,7 @@
 #include <tracy/Tracy.hpp>
 #include <imgui.h>
 #include <algorithm>
+#include <cstdlib>
 
 
 App::App()
@@ -22,7 +23,7 @@ App::App()
   renderer->initFrameDelivery(std::move(surface), [this]() { return mainWindow->getResolution(); });
 
   ImGuiRenderer::enableImGuiForWindow(mainWindow->native());
-  mainCam.lookAt({180, 145, 180}, {0, 15, 0}, {0, 1, 0});
+  mainCam.lookAt({85, 55, 95}, {0, 15, 0}, {0, 1, 0});
   mainCam.zNear = 0.1f;
   mainCam.zFar = 2000;
 }
@@ -38,9 +39,12 @@ void App::run()
 
     windowing.poll();
 
-    processInput(std::min(diffTime, 0.1f));
+    if (std::getenv("ROCK_BENCHMARK") == nullptr)
+      processInput(std::min(diffTime, 0.1f));
 
     drawFrame();
+    if (renderer->isBenchmarkDone())
+      mainWindow->askToClose();
 
     FrameMark;
   }

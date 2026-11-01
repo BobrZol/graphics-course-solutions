@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -63,13 +65,16 @@ WorldRenderer::WorldRenderer()
     .extent = {1024, 1024, 1},
     .name = "terrain_heightmap",
     .format = vk::Format::eR32Sfloat,
-    .imageUsage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+    .imageUsage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+      vk::ImageUsageFlagBits::eTransferSrc,
   });
+
   heightSampler = etna::Sampler(etna::Sampler::CreateInfo{
     .addressMode = vk::SamplerAddressMode::eClampToEdge,
     .name = "height_sampler",
     .maxLod = 0,
   });
+
   materialSampler = etna::Sampler(etna::Sampler::CreateInfo{
     .addressMode = vk::SamplerAddressMode::eRepeat,
     .name = "material_sampler",
@@ -86,12 +91,14 @@ WorldRenderer::WorldRenderer()
       const uint32_t a = z * 257 + x;
       meshIndices.insert(meshIndices.end(), {a, a + 257, a + 1, a + 1, a + 257, a + 258});
     }
+
   indices = ctx.createBuffer(etna::Buffer::CreateInfo{
     .size = meshIndices.size() * sizeof(uint32_t),
     .bufferUsage = vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eIndexBuffer,
     .memoryUsage = VMA_MEMORY_USAGE_GPU_ONLY,
     .name = "terrain_indices",
   });
+
   transfer.uploadBuffer<uint32_t>(*commands, indices, 0, meshIndices);
 
   const std::array names{"sand_03", "sparse_grass", "rock_06", "snow_01"};
@@ -108,6 +115,7 @@ WorldRenderer::WorldRenderer()
       .layers = 4,
       .mipLevels = 11,
     });
+
     for (uint32_t layer = 0; layer < names.size(); ++layer)
     {
       const std::string path = std::string(GRAPHICS_COURSE_RESOURCES_ROOT) +
@@ -124,8 +132,14 @@ WorldRenderer::WorldRenderer()
         {reinterpret_cast<const std::byte*>(pixels.get()), 1024 * 1024 * 4});
     }
   }
+
   auto cmd = commands->start();
   ETNA_CHECK_VK_RESULT(cmd.begin(vk::CommandBufferBeginInfo{}));
+  etna::set_state(cmd, indices.get(), vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+  etna::flush_barriers(cmd);
+  etna::set_state(cmd, indices.get(), vk::PipelineStageFlagBits2::eVertexInput, vk::AccessFlagBits2::eIndexRead);
+  etna::flush_barriers(cmd);
+
   for (const auto* image : images)
     generateMipmaps(cmd, *image);
   ETNA_CHECK_VK_RESULT(cmd.end());
@@ -145,6 +159,7 @@ void WorldRenderer::allocateResources(glm::uvec2 swapchain_resolution)
 
 void WorldRenderer::loadShaders()
 {
+  rocks.loadShaders();
   etna::create_program(
     "terrain", {TERRAIN_SHADERS_ROOT "static_mesh.vert.spv",
                 TERRAIN_SHADERS_ROOT "static_mesh.frag.spv"});
@@ -155,6 +170,7 @@ void WorldRenderer::loadShaders()
 
 void WorldRenderer::setupPipelines(vk::Format swapchain_format)
 {
+  rocks.setupPipeline(swapchain_format);
   outputSrgb = swapchain_format == vk::Format::eB8G8R8A8Srgb ||
     swapchain_format == vk::Format::eR8G8B8A8Srgb;
   auto& manager = etna::get_context().getPipelineManager();
@@ -187,8 +203,10 @@ void WorldRenderer::update(const FramePacket& packet)
 
 void WorldRenderer::drawGui()
 {
-  ImGui::SetNextWindowSize({330, 0}, ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize({330, 650}, ImGuiCond_FirstUseEver);
   ImGui::Begin("Terrain");
+  ImGui::BeginDisabled(std::getenv("ROCK_BENCHMARK") != nullptr);
+  rocks.drawGui();
   if (ImGui::CollapsingHeader("Noise / island", ImGuiTreeNodeFlags_DefaultOpen))
   {
     heightmapDirty |= ImGui::SliderFloat("Frequency", &noiseParams.noise.x, 1, 12);
@@ -221,6 +239,7 @@ void WorldRenderer::drawGui()
   }
   ImGui::TextUnformatted("WASD: move | R/F: up/down\nRMB: mouse look | Shift: faster\nWheel: FOV | Esc: close");
   ImGui::Text("%.1f FPS", ImGui::GetIO().Framerate);
+  ImGui::EndDisabled();
   ImGui::End();
 }
 
@@ -243,6 +262,8 @@ void WorldRenderer::renderWorld(
   if (heightmapDirty)
     generateHeightmap(cmd);
 
+  rocks.upload(cmd, heightmap, heightSampler.get());
+
   const auto shader = etna::get_shader_program("terrain");
   auto set = etna::create_descriptor_set(shader.getDescriptorLayoutId(0), cmd, {
     etna::Binding{0, heightmap.genBinding(heightSampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
@@ -253,11 +274,13 @@ void WorldRenderer::renderWorld(
     etna::Binding{3, detailMaps.genBinding(materialSampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal,
       {.type = vk::ImageViewType::e2DArray})},
   });
+
   const float elevation = glm::radians(sunElevation);
   const float azimuth = glm::radians(sunAzimuth);
   params.sun = glm::vec4(
     std::cos(elevation) * std::cos(azimuth), std::sin(elevation),
     std::cos(elevation) * std::sin(azimuth), params.sun.w);
+
   auto drawParams = params;
   drawParams.cameraExposure.w *= outputSrgb ? 1 : -1;
 
@@ -273,8 +296,88 @@ void WorldRenderer::renderWorld(
   cmd.pushConstants<PushConstants>(terrainPipeline.getVkPipelineLayout(),
     vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, {drawParams});
   cmd.drawIndexed(256 * 256 * 6, 1, 0, 0, 0);
+
   drawParams.terrainSettings.y = -1;
   cmd.pushConstants<PushConstants>(terrainPipeline.getVkPipelineLayout(),
     vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, {drawParams});
   cmd.draw(6, 1, 0, 0);
+
+  drawParams.terrainSettings = params.terrainSettings;
+  rocks.render(cmd, std::as_bytes(std::span{&drawParams, size_t{1}}));
+}
+
+void WorldRenderer::prepareFrame()
+{
+  rocks.beginFrame();
+  if (heightmapDirty)
+    heightValues.clear();
+
+  if (!rocks.isGpuMode() && (heightmapDirty || heightValues.empty()))
+  {
+    auto& ctx = etna::get_context();
+    auto device = ctx.getDevice();
+    vk::UniqueDeviceMemory memory;
+    auto buffer = etna::unwrap_vk_result(device.createBufferUnique(vk::BufferCreateInfo{
+      .size = 1024 * 1024 * sizeof(float),
+      .usage = vk::BufferUsageFlagBits::eTransferDst,
+      .sharingMode = vk::SharingMode::eExclusive,
+    }));
+
+    const auto requirements = device.getBufferMemoryRequirements(buffer.get());
+    const auto properties = ctx.getPhysicalDevice().getMemoryProperties();
+    uint32_t memoryType = 0;
+    while (memoryType < properties.memoryTypeCount)
+    {
+      if ((requirements.memoryTypeBits & (1u << memoryType)) &&
+          (properties.memoryTypes[memoryType].propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible))
+        break;
+      ++memoryType;
+    }
+    if (memoryType == properties.memoryTypeCount)
+      throw std::runtime_error("No host-visible memory for terrain height readback");
+
+    memory = etna::unwrap_vk_result(device.allocateMemoryUnique(vk::MemoryAllocateInfo{
+      .allocationSize = requirements.size,
+      .memoryTypeIndex = memoryType,
+    }));
+    ETNA_CHECK_VK_RESULT(device.bindBufferMemory(buffer.get(), memory.get(), 0));
+
+    auto commands = ctx.createOneShotCmdMgr();
+
+    auto cmd = commands->start();
+    ETNA_CHECK_VK_RESULT(cmd.begin(vk::CommandBufferBeginInfo{}));
+    if (heightmapDirty)
+      generateHeightmap(cmd);
+    etna::set_state(cmd, heightmap.get(), vk::PipelineStageFlagBits2::eTransfer,
+      vk::AccessFlagBits2::eTransferRead, vk::ImageLayout::eTransferSrcOptimal,
+      vk::ImageAspectFlagBits::eColor);
+    etna::flush_barriers(cmd);
+
+    cmd.copyImageToBuffer(heightmap.get(), vk::ImageLayout::eTransferSrcOptimal, buffer.get(),
+      {vk::BufferImageCopy{
+        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .imageExtent = {1024, 1024, 1},
+      }});
+
+    const vk::MemoryBarrier2 barrier{
+      .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+      .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+      .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+      .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmd.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
+    ETNA_CHECK_VK_RESULT(cmd.end());
+    commands->submitAndWait(std::move(cmd));
+
+    const void* mapped = etna::unwrap_vk_result(device.mapMemory(memory.get(), 0, vk::WholeSize));
+    ETNA_CHECK_VK_RESULT(device.invalidateMappedMemoryRanges(
+      {vk::MappedMemoryRange{.memory = memory.get(), .offset = 0, .size = vk::WholeSize}}));
+
+    heightValues.resize(1024 * 1024);
+    std::memcpy(heightValues.data(), mapped, heightValues.size() * sizeof(float));
+    device.unmapMemory(memory.get());
+  }
+
+  rocks.update(heightValues, glm::vec2(params.terrainSettings),
+    glm::vec3(params.cameraExposure), params.projView);
 }
