@@ -12,7 +12,8 @@
 Renderer::Renderer(glm::uvec2 res)
   : resolution{res}
 {
-  useVsync = std::getenv("ROCK_BENCHMARK") == nullptr;
+  useVsync = std::getenv("ROCK_BENCHMARK") == nullptr &&
+    std::getenv("DEFERRED_BENCHMARK") == nullptr;
 }
 
 void Renderer::initVulkan(std::span<const char*> instance_extensions)

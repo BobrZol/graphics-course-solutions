@@ -149,17 +149,14 @@ WorldRenderer::WorldRenderer()
 void WorldRenderer::allocateResources(glm::uvec2 swapchain_resolution)
 {
   resolution = swapchain_resolution;
-  mainViewDepth = etna::get_context().createImage(etna::Image::CreateInfo{
-    .extent = {resolution.x, resolution.y, 1},
-    .name = "main_view_depth",
-    .format = vk::Format::eD32Sfloat,
-    .imageUsage = vk::ImageUsageFlagBits::eDepthStencilAttachment,
-  });
+  deferred.allocateResources(resolution);
 }
 
 void WorldRenderer::loadShaders()
 {
   rocks.loadShaders();
+  deferred.loadShaders();
+  etna::create_program("terrain_depth", {TERRAIN_SHADERS_ROOT "static_mesh.vert.spv"});
   etna::create_program(
     "terrain", {TERRAIN_SHADERS_ROOT "static_mesh.vert.spv",
                 TERRAIN_SHADERS_ROOT "static_mesh.frag.spv"});
@@ -170,17 +167,31 @@ void WorldRenderer::loadShaders()
 
 void WorldRenderer::setupPipelines(vk::Format swapchain_format)
 {
-  rocks.setupPipeline(swapchain_format);
-  outputSrgb = swapchain_format == vk::Format::eB8G8R8A8Srgb ||
-    swapchain_format == vk::Format::eR8G8B8A8Srgb;
+  rocks.setupPipeline();
+  deferred.setupPipelines(swapchain_format);
   auto& manager = etna::get_context().getPipelineManager();
-  terrainPipeline = {};
-  terrainPipeline = manager.createGraphicsPipeline("terrain", etna::GraphicsPipeline::CreateInfo{
-    .fragmentShaderOutput = {
-      .colorAttachmentFormats = {swapchain_format},
-      .depthAttachmentFormat = vk::Format::eD32Sfloat,
-    },
+  depthPipeline = manager.createGraphicsPipeline("terrain_depth", {
+    .blendingConfig = {.attachments = {}, .logicOp = vk::LogicOp::eCopy},
+    .fragmentShaderOutput = {.depthAttachmentFormat = vk::Format::eD32Sfloat},
   });
+
+  for (size_t mode = 0; mode < terrainPipelines.size(); ++mode)
+  {
+    etna::GraphicsPipeline::CreateInfo info{
+      .blendingConfig = {
+        .attachments = std::vector<vk::PipelineColorBlendAttachmentState>(3,
+          {.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+            vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA}),
+        .logicOp = vk::LogicOp::eCopy,
+      },
+      .depthConfig = {.depthTestEnable = vk::True, .depthWriteEnable = vk::False,
+        .depthCompareOp = vk::CompareOp::eEqual},
+      .fragmentShaderOutput = {.colorAttachmentFormats = DeferredRenderer::formats(mode != 0),
+        .depthAttachmentFormat = vk::Format::eD32Sfloat},
+    };
+    terrainPipelines[mode] = manager.createGraphicsPipeline("terrain", info);
+  }
+
   heightmapPipeline = {};
   heightmapPipeline = manager.createGraphicsPipeline("heightmap", etna::GraphicsPipeline::CreateInfo{
     .depthConfig = {.depthTestEnable = vk::False, .depthWriteEnable = vk::False},
@@ -196,6 +207,7 @@ void WorldRenderer::debugInput(const Keyboard& kb)
 
 void WorldRenderer::update(const FramePacket& packet)
 {
+  deferred.update(packet);
   params.projView = packet.mainCam.projTm(float(resolution.x) / float(resolution.y)) *
     packet.mainCam.viewTm();
   params.cameraExposure = glm::vec4(packet.mainCam.position, params.cameraExposure.w);
@@ -205,7 +217,9 @@ void WorldRenderer::drawGui()
 {
   ImGui::SetNextWindowSize({330, 650}, ImGuiCond_FirstUseEver);
   ImGui::Begin("Terrain");
-  ImGui::BeginDisabled(std::getenv("ROCK_BENCHMARK") != nullptr);
+  ImGui::BeginDisabled(std::getenv("ROCK_BENCHMARK") != nullptr ||
+    std::getenv("DEFERRED_BENCHMARK") != nullptr);
+  deferred.drawGui();
   rocks.drawGui();
   if (ImGui::CollapsingHeader("Noise / island", ImGuiTreeNodeFlags_DefaultOpen))
   {
@@ -262,6 +276,7 @@ void WorldRenderer::renderWorld(
   if (heightmapDirty)
     generateHeightmap(cmd);
 
+  deferred.begin(cmd);
   rocks.upload(cmd, heightmap, heightSampler.get());
 
   const auto shader = etna::get_shader_program("terrain");
@@ -281,33 +296,50 @@ void WorldRenderer::renderWorld(
     std::cos(elevation) * std::cos(azimuth), std::sin(elevation),
     std::cos(elevation) * std::sin(azimuth), params.sun.w);
 
-  auto drawParams = params;
-  drawParams.cameraExposure.w *= outputSrgb ? 1 : -1;
+  auto depthSet = etna::create_descriptor_set(
+    etna::get_shader_program("terrain_depth").getDescriptorLayoutId(0), cmd, {
+      etna::Binding{0, heightmap.genBinding(heightSampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+    });
 
-  etna::RenderTargetState targets(
-    cmd, {{0, 0}, {resolution.x, resolution.y}},
-    {{.image = target_image, .view = target_image_view,
-      .clearColorValue = std::array<float, 4>{0.32f, 0.52f, 0.72f, 1}}},
-    {.image = mainViewDepth.get(), .view = mainViewDepth.getView({})});
-  cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, terrainPipeline.getVkPipeline());
-  cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
-    terrainPipeline.getVkPipelineLayout(), 0, {set.getVkSet()}, {});
-  cmd.bindIndexBuffer(indices.get(), 0, vk::IndexType::eUint32);
-  cmd.pushConstants<PushConstants>(terrainPipeline.getVkPipelineLayout(),
-    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, {drawParams});
-  cmd.drawIndexed(256 * 256 * 6, 1, 0, 0, 0);
+  deferred.timestamp(cmd, 1);
 
-  drawParams.terrainSettings.y = -1;
-  cmd.pushConstants<PushConstants>(terrainPipeline.getVkPipelineLayout(),
-    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, {drawParams});
-  cmd.draw(6, 1, 0, 0);
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    const bool depthOnly = pass == 0;
+    auto& pipeline = depthOnly ? depthPipeline : terrainPipelines[deferred.isCompact()];
+    auto drawParams = params;
+    auto stages = depthOnly ? vk::ShaderStageFlagBits::eVertex :
+      vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
 
-  drawParams.terrainSettings = params.terrainSettings;
-  rocks.render(cmd, std::as_bytes(std::span{&drawParams, size_t{1}}));
+    {
+      etna::RenderTargetState targets(cmd, {{0, 0}, {resolution.x, resolution.y}},
+        depthOnly ? std::vector<etna::RenderTargetState::AttachmentParams>{} : deferred.attachments(),
+        deferred.depthAttachment(!depthOnly));
+      cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.getVkPipeline());
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+        pipeline.getVkPipelineLayout(), 0, {depthOnly ? depthSet.getVkSet() : set.getVkSet()}, {});
+      cmd.bindIndexBuffer(indices.get(), 0, vk::IndexType::eUint32);
+      cmd.pushConstants<PushConstants>(pipeline.getVkPipelineLayout(), stages, 0, {drawParams});
+      cmd.drawIndexed(256 * 256 * 6, 1, 0, 0, 0);
+
+      drawParams.terrainSettings.y = -1;
+      cmd.pushConstants<PushConstants>(pipeline.getVkPipelineLayout(), stages, 0, {drawParams});
+      cmd.draw(6, 1, 0, 0);
+
+      drawParams.terrainSettings = params.terrainSettings;
+      rocks.render(cmd, std::as_bytes(std::span{&drawParams, size_t{1}}), depthOnly, deferred.isCompact());
+    }
+
+    deferred.timestamp(cmd, pass + 2);
+  }
+
+  deferred.finish(cmd, target_image, target_image_view, params.cameraExposure, params.sun, params.light,
+    albedoMaps, roughnessMaps, detailMaps, materialSampler.get());
 }
 
 void WorldRenderer::prepareFrame()
 {
+  deferred.beginFrame();
   rocks.beginFrame();
   if (heightmapDirty)
     heightValues.clear();

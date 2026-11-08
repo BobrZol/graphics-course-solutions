@@ -1,4 +1,5 @@
 #include "RockRenderer.hpp"
+#include "DeferredRenderer.hpp"
 
 #include <etna/BlockingTransferHelper.hpp>
 #include <etna/GlobalContext.hpp>
@@ -301,31 +302,41 @@ void RockRenderer::loadModel(Model& target, const char* name)
 
 void RockRenderer::loadShaders()
 {
+  etna::create_program("rocks_depth", {TERRAIN_SHADERS_ROOT "rocks.vert.spv"});
   etna::create_program("generate_rocks", {TERRAIN_SHADERS_ROOT "rocks.comp.spv"});
   etna::create_program("rocks", {TERRAIN_SHADERS_ROOT "rocks.vert.spv", TERRAIN_SHADERS_ROOT "rocks.frag.spv"});
 }
 
-void RockRenderer::setupPipeline(vk::Format format)
+void RockRenderer::setupPipeline()
 {
-  computePipeline = {};
-  computePipeline = etna::get_context().getPipelineManager().createComputePipeline("generate_rocks", {});
+  auto& manager = etna::get_context().getPipelineManager();
+  computePipeline = manager.createComputePipeline("generate_rocks", {});
 
-  pipeline = {};
-  pipeline = etna::get_context().getPipelineManager().createGraphicsPipeline("rocks",
-    etna::GraphicsPipeline::CreateInfo{
-      .vertexShaderInput = {.bindings = {etna::VertexShaderInputDescription::Binding{.byteStreamDescription = {
-        .stride = sizeof(Vertex),
-        .attributes = {
-          {.format = vk::Format::eR32G32B32Sfloat, .offset = offsetof(Vertex, position)},
-          {.format = vk::Format::eR32G32B32Sfloat, .offset = offsetof(Vertex, normal)},
-          {.format = vk::Format::eR32G32Sfloat, .offset = offsetof(Vertex, uv)},
-        },
-      }}}},
-      .fragmentShaderOutput = {
-        .colorAttachmentFormats = {format},
-        .depthAttachmentFormat = vk::Format::eD32Sfloat,
+  etna::GraphicsPipeline::CreateInfo info{
+    .vertexShaderInput = {.bindings = {etna::VertexShaderInputDescription::Binding{.byteStreamDescription = {
+      .stride = sizeof(Vertex),
+      .attributes = {
+        {.format = vk::Format::eR32G32B32Sfloat, .offset = offsetof(Vertex, position)},
+        {.format = vk::Format::eR32G32B32Sfloat, .offset = offsetof(Vertex, normal)},
+        {.format = vk::Format::eR32G32Sfloat, .offset = offsetof(Vertex, uv)},
       },
-    });
+    }}}},
+    .blendingConfig = {.attachments = {}, .logicOp = vk::LogicOp::eCopy},
+    .fragmentShaderOutput = {.depthAttachmentFormat = vk::Format::eD32Sfloat},
+  };
+  depthPipeline = manager.createGraphicsPipeline("rocks_depth", info);
+
+  info.depthConfig.depthWriteEnable = vk::False;
+  info.depthConfig.depthCompareOp = vk::CompareOp::eEqual;
+  info.blendingConfig.attachments = std::vector<vk::PipelineColorBlendAttachmentState>(3,
+    {.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+      vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA});
+
+  for (size_t mode = 0; mode < pipelines.size(); ++mode)
+  {
+    info.fragmentShaderOutput.colorAttachmentFormats = DeferredRenderer::formats(mode != 0);
+    pipelines[mode] = manager.createGraphicsPipeline("rocks", info);
+  }
 }
 
 void RockRenderer::drawGui()
@@ -513,6 +524,11 @@ void RockRenderer::upload(vk::CommandBuffer cmd, const etna::Image& heightmap, v
   for (size_t i = 0; i < models.size(); ++i)
   {
     descriptorSets[i].reset();
+    depthDescriptorSets[i].reset();
+    depthDescriptorSets[i].emplace(etna::create_descriptor_set(
+      etna::get_shader_program("rocks_depth").getDescriptorLayoutId(0), cmd, {
+        etna::Binding{0, frame.instances.genBinding(i * 65536 * sizeof(Instance), 65536 * sizeof(Instance))},
+      }));
     auto& model = models[i];
     descriptorSets[i].emplace(etna::create_descriptor_set(shader.getDescriptorLayoutId(0), cmd, {
       etna::Binding{0, frame.instances.genBinding(i * 65536 * sizeof(Instance), 65536 * sizeof(Instance))},
@@ -537,17 +553,20 @@ void RockRenderer::upload(vk::CommandBuffer cmd, const etna::Image& heightmap, v
   frame.visible = instances[0].size() + instances[1].size();
 }
 
-void RockRenderer::render(vk::CommandBuffer cmd, std::span<const std::byte> params)
+void RockRenderer::render(vk::CommandBuffer cmd, std::span<const std::byte> params,
+  bool depth_only, bool compact)
 {
   ETNA_PROFILE_GPU(cmd, renderRocks);
   auto& frame = frameResources->get();
+  auto& pipeline = depth_only ? depthPipeline : pipelines[compact];
 
-  if (timestampsSupported)
+  if (timestampsSupported && !depth_only)
     cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, frame.queries.get(), 2);
 
   cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.getVkPipeline());
   cmd.pushConstants(pipeline.getVkPipelineLayout(),
-    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+    depth_only ? vk::ShaderStageFlagBits::eVertex :
+      vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
     0, static_cast<uint32_t>(params.size()), params.data());
   for (size_t i = 0; i < models.size(); ++i)
   {
@@ -555,7 +574,7 @@ void RockRenderer::render(vk::CommandBuffer cmd, std::span<const std::byte> para
       continue;
 
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.getVkPipelineLayout(),
-      0, {descriptorSets[i]->getVkSet()}, {});
+      0, {(depth_only ? depthDescriptorSets[i] : descriptorSets[i])->getVkSet()}, {});
     cmd.bindVertexBuffers(0, {models[i].vertices.get()}, {0});
     cmd.bindIndexBuffer(models[i].indices.get(), 0, vk::IndexType::eUint32);
 
@@ -566,7 +585,7 @@ void RockRenderer::render(vk::CommandBuffer cmd, std::span<const std::byte> para
       cmd.drawIndexed(models[i].indexCount, static_cast<uint32_t>(instances[i].size()), 0, 0, 0);
   }
 
-  if (timestampsSupported)
+  if (timestampsSupported && !depth_only)
   {
     cmd.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, frame.queries.get(), 3);
     frame.hasQueries = true;

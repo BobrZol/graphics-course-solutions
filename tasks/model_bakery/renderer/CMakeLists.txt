@@ -5,6 +5,7 @@ add_executable(terrain
   Renderer.cpp
   WorldRenderer.cpp
   RockRenderer.cpp
+  DeferredRenderer.cpp
 )
 
 target_link_libraries(terrain
@@ -18,4 +19,7 @@ target_add_shaders(terrain
   shaders/rocks.vert
   shaders/rocks.frag
   shaders/rocks.comp
+  shaders/lighting.frag
+  shaders/decals.frag
+  shaders/clusters.comp
 )

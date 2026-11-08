@@ -9,6 +9,7 @@
 #include "wsi/Keyboard.hpp"
 #include "FramePacket.hpp"
 #include "RockRenderer.hpp"
+#include "DeferredRenderer.hpp"
 
 
 class WorldRenderer
@@ -24,7 +25,7 @@ public:
   void update(const FramePacket& packet);
   void drawGui();
   void prepareFrame();
-  bool isBenchmarkDone() const { return rocks.isBenchmarkDone(); }
+  bool isBenchmarkDone() const { return rocks.isBenchmarkDone() || deferred.isBenchmarkDone(); }
   void renderWorld(
     vk::CommandBuffer cmd_buf, vk::Image target_image, vk::ImageView target_image_view);
 
@@ -32,9 +33,9 @@ private:
   void generateHeightmap(vk::CommandBuffer cmd_buf);
 
   RockRenderer rocks;
+  DeferredRenderer deferred;
   std::vector<float> heightValues;
 
-  etna::Image mainViewDepth;
   etna::Image heightmap;
   etna::Image albedoMaps;
   etna::Image roughnessMaps;
@@ -61,8 +62,8 @@ private:
   float sunAzimuth = 135;
   float sunElevation = 45;
   bool heightmapDirty = true;
-  bool outputSrgb = true;
-  etna::GraphicsPipeline terrainPipeline{};
+  std::array<etna::GraphicsPipeline, 2> terrainPipelines;
+  etna::GraphicsPipeline depthPipeline;
   etna::GraphicsPipeline heightmapPipeline{};
   glm::uvec2 resolution{};
 };

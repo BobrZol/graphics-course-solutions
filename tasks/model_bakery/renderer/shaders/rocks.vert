@@ -23,6 +23,8 @@ layout(location = 1) out vec3 worldNormal;
 layout(location = 2) out vec2 texCoord;
 layout(location = 3) out vec3 colorVariation;
 
+invariant gl_Position;
+
 void main()
 {
   Instance instance = instances[gl_InstanceIndex];

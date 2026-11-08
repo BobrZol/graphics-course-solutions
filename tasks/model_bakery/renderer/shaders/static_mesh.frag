@@ -9,9 +9,11 @@ layout(set = 0, binding = 3) uniform sampler2DArray detailMaps;
 
 layout(location = 0) in vec3 worldPosition;
 layout(location = 1) in vec2 terrainUV;
-layout(location = 0) out vec4 outColor;
+layout(location = 0) out vec4 outAlbedo;
+layout(location = 1) out vec2 outNormal;
+layout(location = 2) out vec4 outMaterial;
 
-#include "pbr.glsl"
+#include "gbuffer.glsl"
 
 void main()
 {
@@ -63,9 +65,7 @@ void main()
       params.terrain.w * params.terrain.z / params.terrain.x;
     normal = normalize(normal - (detailGradient - normal * dot(normal, detailGradient)));
   }
-  vec3 color = lighting(albedo, clamp(roughness, 0.045, 1.0), normal);
-  color = vec3(1) - exp(-color * abs(params.cameraExposure.w));
-  if (params.cameraExposure.w < 0.0)
-    color = pow(color, vec3(1.0 / 2.2));
-  outColor = vec4(color, 1.0);
+  outAlbedo = vec4(albedo, 1.0);
+  outNormal = encodeNormal(normal);
+  outMaterial = vec4(clamp(roughness, 0.045, 1.0), 0.0, 1.0, 1.0);
 }

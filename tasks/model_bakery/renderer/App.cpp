@@ -39,7 +39,8 @@ void App::run()
 
     windowing.poll();
 
-    if (std::getenv("ROCK_BENCHMARK") == nullptr)
+    if (std::getenv("ROCK_BENCHMARK") == nullptr &&
+        std::getenv("DEFERRED_BENCHMARK") == nullptr)
       processInput(std::min(diffTime, 0.1f));
 
     drawFrame();

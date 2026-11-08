@@ -22,7 +22,7 @@ public:
   RockRenderer();
 
   void loadShaders();
-  void setupPipeline(vk::Format format);
+  void setupPipeline();
   void drawGui();
   void beginFrame();
 
@@ -33,7 +33,7 @@ public:
     std::span<const float> heights, glm::vec2 terrain_size,
     glm::vec3 camera, const glm::mat4& proj_view);
   void upload(vk::CommandBuffer cmd, const etna::Image& heightmap, vk::Sampler height_sampler);
-  void render(vk::CommandBuffer cmd, std::span<const std::byte> params);
+  void render(vk::CommandBuffer cmd, std::span<const std::byte> params, bool depth_only, bool compact);
 
 private:
   struct Vertex
@@ -96,7 +96,9 @@ private:
   std::array<std::optional<etna::DescriptorSet>, 2> descriptorSets;
 
   etna::Sampler sampler;
-  etna::GraphicsPipeline pipeline;
+  std::array<etna::GraphicsPipeline, 2> pipelines;
+  etna::GraphicsPipeline depthPipeline;
+  std::array<std::optional<etna::DescriptorSet>, 2> depthDescriptorSets;
   etna::ComputePipeline computePipeline;
 
   bool gpuMode = true;

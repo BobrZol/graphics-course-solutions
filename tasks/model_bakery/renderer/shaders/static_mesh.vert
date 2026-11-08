@@ -6,6 +6,8 @@
 layout(location = 0) out vec3 worldPosition;
 layout(location = 1) out vec2 terrainUV;
 
+invariant gl_Position;
+
 void main()
 {
   if (params.terrain.y < 0.0)
