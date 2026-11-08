@@ -1,0 +1,50 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "deferred_params.glsl"
+#include "local_lights.glsl"
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 6, std430) writeonly buffer ClusterLights
+{
+  uint entries[];
+};
+
+void main()
+{
+  uint cluster = gl_GlobalInvocationID.x;
+
+  if (cluster >= 16 * 9 * 24)
+    return;
+
+  uvec3 cell = uvec3(cluster % 16, cluster / 16 % 9, cluster / (16 * 9));
+  float nearDepth = scene.screen.z * pow(scene.screen.w / scene.screen.z, float(cell.z) / 24.0);
+  float farDepth = scene.screen.z * pow(scene.screen.w / scene.screen.z, float(cell.z + 1) / 24.0);
+  vec3 minimum = vec3(1e30);
+  vec3 maximum = vec3(-1e30);
+
+  for (uint corner = 0; corner < 8; ++corner)
+  {
+    vec2 uv = (vec2(cell.xy) + vec2(corner & 1, (corner >> 1) & 1)) / vec2(16, 9);
+    vec4 ray = scene.inverseProjection * vec4(uv * 2.0 - 1.0, 1, 1);
+    vec3 point = ray.xyz / -ray.z * (corner < 4 ? nearDepth : farDepth);
+    minimum = min(minimum, point);
+    maximum = max(maximum, point);
+  }
+
+  uint offset = cluster * 1025;
+  uint count = 0;
+
+  for (uint i = 0; i < uint(scene.options.x); ++i)
+  {
+    vec3 center = (scene.view * vec4(lights[i].positionRadius.xyz, 1)).xyz;
+    vec3 delta = center - clamp(center, minimum, maximum);
+    float radius = lights[i].positionRadius.w;
+
+    if (dot(delta, delta) <= radius * radius)
+      entries[offset + 1 + count++] = i;
+  }
+
+  entries[offset] = count;
+}
