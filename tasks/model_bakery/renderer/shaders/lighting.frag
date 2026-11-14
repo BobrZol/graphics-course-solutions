@@ -16,6 +16,8 @@ layout(set = 0, binding = 6, std430) readonly buffer ClusterLights
   uint entries[];
 };
 
+layout(set = 0, binding = 10) uniform samplerCube skyMap;
+
 layout(location = 0) out vec4 outColor;
 
 void main()
@@ -25,7 +27,14 @@ void main()
 
   if (depth >= 1.0)
   {
-    outColor = vec4(0.32, 0.52, 0.72, 1.0);
+    vec3 direction = normalize(reconstructPosition(pixel, 1.0) - scene.cameraExposure.xyz);
+    vec3 color = textureLod(skyMap, direction, 0).rgb;
+    color = vec3(1) - exp(-color * abs(scene.cameraExposure.w));
+
+    if (scene.cameraExposure.w < 0.0)
+      color = pow(color, vec3(1.0 / 2.2));
+
+    outColor = vec4(color, 1.0);
     return;
   }
 

@@ -41,6 +41,21 @@ public:
 
 private:
   void allocateGbuffer();
+  void bakeSky(vk::CommandBuffer cmd, glm::vec4 sun, glm::vec4 color);
+
+  struct SkyParameters
+  {
+    glm::vec4 sun{};
+    glm::vec4 color{};
+    glm::vec4 clouds{0.45f, 0.008f, 400, 48};
+    glm::vec4 layer{500, 900, 6, 0};
+  } skyParameters;
+
+  bool skyDirty = true;
+  etna::Image sky;
+  etna::Sampler skySampler;
+  etna::GraphicsPipeline skyPipeline;
+
 
   struct Parameters
   {

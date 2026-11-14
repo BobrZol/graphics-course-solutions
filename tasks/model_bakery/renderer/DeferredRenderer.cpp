@@ -21,6 +21,16 @@ DeferredRenderer::DeferredRenderer()
   timestampPeriod = properties.limits.timestampPeriod;
   timestampMask = queue.timestampValidBits == 64 ? ~uint64_t{0} : (uint64_t{1} << queue.timestampValidBits) - 1;
 
+  sky = ctx.createImage({
+    .extent = {2048, 2048, 1},
+    .name = "sky_cubemap",
+    .format = vk::Format::eR16G16B16A16Sfloat,
+    .imageUsage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+    .layers = 6,
+    .flags = vk::ImageCreateFlagBits::eCubeCompatible,
+  });
+  skySampler = etna::Sampler({.name = "sky_sampler", .maxLod = 0});
+
   sampler = etna::Sampler({
     .filter = vk::Filter::eNearest,
     .mipmapMode = vk::SamplerMipmapMode::eNearest,
@@ -141,6 +151,8 @@ void DeferredRenderer::allocateGbuffer()
 
 void DeferredRenderer::loadShaders()
 {
+  etna::create_program("sky",
+    {TERRAIN_SHADERS_ROOT "heightmap.vert.spv", TERRAIN_SHADERS_ROOT "sky.frag.spv"});
   etna::create_program("deferred_lighting",
     {TERRAIN_SHADERS_ROOT "heightmap.vert.spv", TERRAIN_SHADERS_ROOT "lighting.frag.spv"});
   etna::create_program("decals",
@@ -152,6 +164,11 @@ void DeferredRenderer::setupPipelines(vk::Format output_format)
 {
   auto& manager = etna::get_context().getPipelineManager();
   outputSrgb = output_format == vk::Format::eB8G8R8A8Srgb || output_format == vk::Format::eR8G8B8A8Srgb;
+
+  skyPipeline = manager.createGraphicsPipeline("sky", {
+    .depthConfig = {.depthTestEnable = vk::False, .depthWriteEnable = vk::False},
+    .fragmentShaderOutput = {.colorAttachmentFormats = {vk::Format::eR16G16B16A16Sfloat}},
+  });
 
   lightingPipeline = manager.createGraphicsPipeline("deferred_lighting", {
     .depthConfig = {.depthTestEnable = vk::False, .depthWriteEnable = vk::False},
@@ -200,6 +217,24 @@ void DeferredRenderer::update(const FramePacket& packet)
 
 void DeferredRenderer::drawGui()
 {
+  if (ImGui::CollapsingHeader("Sky / clouds"))
+  {
+    skyDirty |= ImGui::SliderFloat("Cloud coverage", &skyParameters.clouds.x, 0, 1);
+    skyDirty |= ImGui::SliderFloat("Cloud density", &skyParameters.clouds.y, 0, 0.03f, "%.4f");
+    skyDirty |= ImGui::SliderFloat("Cloud scale", &skyParameters.clouds.z, 50, 1500);
+    skyDirty |= ImGui::SliderFloat("Layer bottom", &skyParameters.layer.x, 100, 2000);
+    skyParameters.layer.y = std::max(skyParameters.layer.y, skyParameters.layer.x + 50);
+    skyDirty |= ImGui::SliderFloat("Layer top", &skyParameters.layer.y,
+      skyParameters.layer.x + 50, 4000);
+
+    int steps = static_cast<int>(skyParameters.clouds.w);
+    int shadowSteps = static_cast<int>(skyParameters.layer.z);
+    skyDirty |= ImGui::SliderInt("Sky ray steps", &steps, 8, 96);
+    skyDirty |= ImGui::SliderInt("Sky shadow steps", &shadowSteps, 1, 16);
+    skyParameters.clouds.w = static_cast<float>(steps);
+    skyParameters.layer.z = static_cast<float>(shadowSteps);
+  }
+
   if (!ImGui::CollapsingHeader("Deferred", ImGuiTreeNodeFlags_DefaultOpen))
     return;
 
@@ -298,6 +333,7 @@ void DeferredRenderer::finish(vk::CommandBuffer cmd, vk::Image output, vk::Image
   vk::Sampler material_sampler)
 {
   auto& frame = frames->get();
+  bakeSky(cmd, sun, light);
   parameters.cameraExposure = camera;
   parameters.cameraExposure.w *= outputSrgb ? 1 : -1;
   parameters.sun = sun;
@@ -386,6 +422,8 @@ void DeferredRenderer::finish(vk::CommandBuffer cmd, vk::Image output, vk::Image
     etna::Binding{4, frame.parameters.genBinding()},
     etna::Binding{5, frame.lights.genBinding()},
     etna::Binding{6, frame.clusters.genBinding()},
+    etna::Binding{10, sky.genBinding(skySampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal,
+      {.type = vk::ImageViewType::eCube})},
   });
 
   {
@@ -400,4 +438,30 @@ void DeferredRenderer::finish(vk::CommandBuffer cmd, vk::Image output, vk::Image
   timestamp(cmd, 6);
   frame.hasQueries = timestampsSupported;
   frame.benchmarkPhase = benchmarkPhase;
+}
+
+
+void DeferredRenderer::bakeSky(vk::CommandBuffer cmd, glm::vec4 sun, glm::vec4 color)
+{
+  color.w = 0;
+
+  if (!skyDirty && skyParameters.sun == sun && skyParameters.color == color)
+    return;
+
+  skyParameters.sun = sun;
+  skyParameters.color = color;
+
+  for (uint32_t face = 0; face < 6; ++face)
+  {
+    skyParameters.layer.w = static_cast<float>(face);
+    etna::RenderTargetState target(cmd, {{0, 0}, {2048, 2048}},
+      {{.image = sky.get(),
+        .view = sky.getView({.baseLayer = face, .layerCount = 1, .type = vk::ImageViewType::e2D})}}, {});
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, skyPipeline.getVkPipeline());
+    cmd.pushConstants<SkyParameters>(skyPipeline.getVkPipelineLayout(),
+      vk::ShaderStageFlagBits::eFragment, 0, {skyParameters});
+    cmd.draw(3, 1, 0, 0);
+  }
+
+  skyDirty = false;
 }
