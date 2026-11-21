@@ -41,6 +41,22 @@ public:
 
 private:
   void allocateGbuffer();
+  void postprocess(vk::CommandBuffer cmd, vk::Image output, vk::ImageView view);
+
+  etna::Image hdr;
+  etna::Image colorLut;
+  etna::Buffer exposureStatistics;
+  etna::GraphicsPipeline postPipeline;
+  etna::ComputePipeline exposurePipeline;
+  double histogramMs = 0;
+  bool toneMapping = true;
+  bool colorGrading = false;
+  bool sharedHistogram = true;
+  bool exposureInitialized = false;
+  float exposureCompensation = 0;
+  float deltaTime = 0.016f;
+  float previousTime = 0;
+
   void bakeSky(vk::CommandBuffer cmd, glm::vec4 sun, glm::vec4 color);
 
   struct SkyParameters

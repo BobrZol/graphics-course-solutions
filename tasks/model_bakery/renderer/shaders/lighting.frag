@@ -29,11 +29,6 @@ void main()
   {
     vec3 direction = normalize(reconstructPosition(pixel, 1.0) - scene.cameraExposure.xyz);
     vec3 color = textureLod(skyMap, direction, 0).rgb;
-    color = vec3(1) - exp(-color * abs(scene.cameraExposure.w));
-
-    if (scene.cameraExposure.w < 0.0)
-      color = pow(color, vec3(1.0 / 2.2));
-
     outColor = vec4(color, 1.0);
     return;
   }
@@ -70,11 +65,6 @@ void main()
     color += evaluateBRDF(albedo, roughness, metallic, n, v, l) *
       source.colorIntensity.rgb * source.colorIntensity.w * falloff;
   }
-
-  color = vec3(1) - exp(-color * abs(scene.cameraExposure.w));
-
-  if (scene.cameraExposure.w < 0.0)
-    color = pow(color, vec3(1.0 / 2.2));
 
   outColor = vec4(color, 1);
 }

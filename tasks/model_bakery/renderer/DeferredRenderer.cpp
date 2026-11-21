@@ -1,6 +1,7 @@
 #include "DeferredRenderer.hpp"
 
 #include <etna/GlobalContext.hpp>
+#include <etna/BlockingTransferHelper.hpp>
 #include <etna/PipelineManager.hpp>
 #include <glm/ext.hpp>
 #include <imgui.h>
@@ -31,6 +32,49 @@ DeferredRenderer::DeferredRenderer()
   });
   skySampler = etna::Sampler({.name = "sky_sampler", .maxLod = 0});
 
+  exposureStatistics = ctx.createBuffer({
+    .size = 103 * sizeof(uint32_t),
+    .bufferUsage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+    .name = "exposure_statistics",
+  });
+
+  colorLut = ctx.createImage({
+    .extent = {32, 32, 32},
+    .name = "color_lut",
+    .format = vk::Format::eR8G8B8A8Unorm,
+    .imageUsage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst,
+    .type = vk::ImageType::e3D,
+  });
+
+  std::vector<std::byte> lut(32 * 32 * 32 * 4);
+  std::ifstream lutFile(std::string(GRAPHICS_COURSE_RESOURCES_ROOT) + "/textures/grading/lut.rgba", std::ios::binary);
+  if (!lutFile.read(reinterpret_cast<char*>(lut.data()), static_cast<std::streamsize>(lut.size())))
+    throw std::runtime_error("Cannot read color LUT");
+
+  auto commands = ctx.createOneShotCmdMgr();
+  auto staging = ctx.createBuffer({
+    .size = lut.size(),
+    .bufferUsage = vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
+    .name = "lut_upload",
+  });
+  auto cmd = commands->start();
+  ETNA_CHECK_VK_RESULT(cmd.begin(vk::CommandBufferBeginInfo{}));
+
+  for (size_t offset = 0; offset < lut.size(); offset += 65536)
+    cmd.updateBuffer(staging.get(), offset, std::min(size_t{65536}, lut.size() - offset), lut.data() + offset);
+
+  etna::set_state(cmd, staging.get(), vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+  etna::flush_barriers(cmd);
+  etna::set_state(cmd, staging.get(), vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+  etna::set_state(cmd, colorLut.get(), vk::PipelineStageFlagBits2::eTransfer,
+    vk::AccessFlagBits2::eTransferWrite, vk::ImageLayout::eTransferDstOptimal, vk::ImageAspectFlagBits::eColor);
+  etna::flush_barriers(cmd);
+  cmd.copyBufferToImage(staging.get(), colorLut.get(), vk::ImageLayout::eTransferDstOptimal,
+    {vk::BufferImageCopy{.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+      .imageExtent = {32, 32, 32}}});
+  ETNA_CHECK_VK_RESULT(cmd.end());
+  commands->submitAndWait(std::move(cmd));
+
   sampler = etna::Sampler({
     .filter = vk::Filter::eNearest,
     .mipmapMode = vk::SamplerMipmapMode::eNearest,
@@ -59,7 +103,7 @@ DeferredRenderer::DeferredRenderer()
     if (timestampsSupported)
       frame.queries = etna::unwrap_vk_result(ctx.getDevice().createQueryPoolUnique({
         .queryType = vk::QueryType::eTimestamp,
-        .queryCount = 7,
+        .queryCount = 9,
       }));
 
     return frame;
@@ -123,6 +167,12 @@ std::vector<vk::Format> DeferredRenderer::formats(bool compact)
 void DeferredRenderer::allocateResources(glm::uvec2 size)
 {
   resolution = size;
+  hdr = etna::get_context().createImage({
+    .extent = {size.x, size.y, 1},
+    .name = "hdr",
+    .format = vk::Format::eB10G11R11UfloatPack32,
+    .imageUsage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+  });
   auto& ctx = etna::get_context();
 
   depth = ctx.createImage({
@@ -151,6 +201,8 @@ void DeferredRenderer::allocateGbuffer()
 
 void DeferredRenderer::loadShaders()
 {
+  etna::create_program("exposure", {TERRAIN_SHADERS_ROOT "exposure.comp.spv"});
+  etna::create_program("post", {TERRAIN_SHADERS_ROOT "heightmap.vert.spv", TERRAIN_SHADERS_ROOT "post.frag.spv"});
   etna::create_program("sky",
     {TERRAIN_SHADERS_ROOT "heightmap.vert.spv", TERRAIN_SHADERS_ROOT "sky.frag.spv"});
   etna::create_program("deferred_lighting",
@@ -170,9 +222,15 @@ void DeferredRenderer::setupPipelines(vk::Format output_format)
     .fragmentShaderOutput = {.colorAttachmentFormats = {vk::Format::eR16G16B16A16Sfloat}},
   });
 
-  lightingPipeline = manager.createGraphicsPipeline("deferred_lighting", {
+  exposurePipeline = manager.createComputePipeline("exposure", {});
+  postPipeline = manager.createGraphicsPipeline("post", {
     .depthConfig = {.depthTestEnable = vk::False, .depthWriteEnable = vk::False},
     .fragmentShaderOutput = {.colorAttachmentFormats = {output_format}},
+  });
+
+  lightingPipeline = manager.createGraphicsPipeline("deferred_lighting", {
+    .depthConfig = {.depthTestEnable = vk::False, .depthWriteEnable = vk::False},
+    .fragmentShaderOutput = {.colorAttachmentFormats = {vk::Format::eB10G11R11UfloatPack32}},
   });
 
   for (size_t mode = 0; mode < 2; ++mode)
@@ -208,6 +266,8 @@ etna::RenderTargetState::AttachmentParams DeferredRenderer::depthAttachment(bool
 
 void DeferredRenderer::update(const FramePacket& packet)
 {
+  deltaTime = std::clamp(packet.currentTime - previousTime, 0.0f, 0.25f);
+  previousTime = packet.currentTime;
   const auto projection = packet.mainCam.projTm(float(resolution.x) / float(resolution.y));
   parameters.view = packet.mainCam.viewTm();
   parameters.inverseViewProjection = glm::inverse(projection * parameters.view);
@@ -217,6 +277,15 @@ void DeferredRenderer::update(const FramePacket& packet)
 
 void DeferredRenderer::drawGui()
 {
+  if (ImGui::CollapsingHeader("Postprocessing", ImGuiTreeNodeFlags_DefaultOpen))
+  {
+    ImGui::Checkbox("Tone mapping", &toneMapping);
+    ImGui::Checkbox("Color grading", &colorGrading);
+    ImGui::Checkbox("Shared histogram", &sharedHistogram);
+    ImGui::Text("Exposure GPU: %.3f ms", histogramMs);
+    ImGui::SliderFloat("Exposure compensation", &exposureCompensation, -4, 4);
+  }
+
   if (ImGui::CollapsingHeader("Sky / clouds"))
   {
     skyDirty |= ImGui::SliderFloat("Cloud coverage", &skyParameters.clouds.x, 0, 1);
@@ -264,12 +333,33 @@ void DeferredRenderer::beginFrame()
 
   if (frame.hasQueries)
   {
-    std::array<uint64_t, 7> values{};
+    std::array<uint64_t, 9> values{};
     const auto result = etna::get_context().getDevice().getQueryPoolResults(frame.queries.get(),
-      0, 7, sizeof(values), values.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64);
+      0, 9, sizeof(values), values.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64);
 
     if (result == vk::Result::eSuccess)
     {
+      histogramMs = double((values[8] - values[7]) & timestampMask) * timestampPeriod / 1e6;
+      if (std::getenv("EXPOSURE_BENCHMARK"))
+      {
+        static int samples = 0;
+        static double total = 0;
+        ++samples;
+
+        if (samples > 30)
+          total += histogramMs;
+
+        if (samples == 150)
+        {
+          spdlog::info("Exposure benchmark: shared={}, mean_ms={}", sharedHistogram, total / 120);
+          if (!sharedHistogram)
+            benchmarkDone = true;
+          sharedHistogram = false;
+          samples = 0;
+          total = 0;
+        }
+      }
+
       for (size_t i = 0; i < 5; ++i)
         timings[i] = double((values[i + 2] - values[i + 1]) & timestampMask) * timestampPeriod / 1e6;
       timings[5] = double((values[6] - values[0]) & timestampMask) * timestampPeriod / 1e6;
@@ -322,7 +412,7 @@ void DeferredRenderer::timestamp(vk::CommandBuffer cmd, uint32_t index)
 void DeferredRenderer::begin(vk::CommandBuffer cmd)
 {
   if (timestampsSupported)
-    cmd.resetQueryPool(frames->get().queries.get(), 0, 7);
+    cmd.resetQueryPool(frames->get().queries.get(), 0, 9);
 
   timestamp(cmd, 0);
 }
@@ -428,13 +518,14 @@ void DeferredRenderer::finish(vk::CommandBuffer cmd, vk::Image output, vk::Image
 
   {
     etna::RenderTargetState targets(cmd, {{0, 0}, {resolution.x, resolution.y}},
-      {{.image = output, .view = output_view}}, {});
+      {{.image = hdr.get(), .view = hdr.getView({})}}, {});
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, lightingPipeline.getVkPipeline());
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, lightingPipeline.getVkPipelineLayout(),
       0, {set.getVkSet()}, {});
     cmd.draw(3, 1, 0, 0);
   }
 
+  postprocess(cmd, output, output_view);
   timestamp(cmd, 6);
   frame.hasQueries = timestampsSupported;
   frame.benchmarkPhase = benchmarkPhase;
@@ -464,4 +555,78 @@ void DeferredRenderer::bakeSky(vk::CommandBuffer cmd, glm::vec4 sun, glm::vec4 c
   }
 
   skyDirty = false;
+}
+
+
+void DeferredRenderer::postprocess(vk::CommandBuffer cmd, vk::Image output, vk::ImageView view)
+{
+  etna::set_state(cmd, exposureStatistics.get(), vk::PipelineStageFlagBits2::eTransfer,
+    vk::AccessFlagBits2::eTransferWrite);
+  etna::flush_barriers(cmd);
+  cmd.fillBuffer(exposureStatistics.get(), 4, exposureInitialized ? 404 : 408, 0);
+  uint32_t minimum = 0x7f7fffff;
+  cmd.updateBuffer(exposureStatistics.get(), 0, sizeof(minimum), &minimum);
+  exposureInitialized = true;
+
+  struct ComputeSettings
+  {
+    int phase;
+    int shared;
+    float dt;
+    float compensation;
+  } settings{0, sharedHistogram ? 1 : 0, deltaTime, 0};
+
+  auto program = etna::get_shader_program("exposure");
+  auto set = etna::create_descriptor_set(program.getDescriptorLayoutId(0), cmd, {
+    etna::Binding{0, hdr.genBinding(sampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+    etna::Binding{1, exposureStatistics.genBinding()},
+  });
+
+  timestamp(cmd, 7);
+
+  for (int phase = 0; phase < 3; ++phase)
+  {
+    etna::set_state(cmd, exposureStatistics.get(), vk::PipelineStageFlagBits2::eComputeShader,
+      vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite);
+    etna::flush_barriers(cmd);
+    settings.phase = phase;
+    cmd.bindPipeline(vk::PipelineBindPoint::eCompute, exposurePipeline.getVkPipeline());
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, exposurePipeline.getVkPipelineLayout(),
+      0, {set.getVkSet()}, {});
+    cmd.pushConstants<ComputeSettings>(exposurePipeline.getVkPipelineLayout(),
+      vk::ShaderStageFlagBits::eCompute, 0, {settings});
+    cmd.dispatch(phase == 2 ? 1 : (resolution.x + 15) / 16,
+      phase == 2 ? 1 : (resolution.y + 15) / 16, 1);
+  }
+
+  etna::set_state(cmd, exposureStatistics.get(), vk::PipelineStageFlagBits2::eFragmentShader,
+    vk::AccessFlagBits2::eShaderStorageRead);
+  etna::flush_barriers(cmd);
+
+  timestamp(cmd, 8);
+
+  auto post = etna::get_shader_program("post");
+  auto postSet = etna::create_descriptor_set(post.getDescriptorLayoutId(0), cmd, {
+    etna::Binding{0, hdr.genBinding(sampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal)},
+    etna::Binding{1, exposureStatistics.genBinding()},
+    etna::Binding{2, colorLut.genBinding(skySampler.get(), vk::ImageLayout::eShaderReadOnlyOptimal,
+      {.type = vk::ImageViewType::e3D})},
+  });
+
+  struct PostSettings
+  {
+    int toneMapping;
+    int grading;
+    float compensation;
+    int srgb;
+  } postSettings{toneMapping ? 1 : 0, colorGrading ? 1 : 0, exposureCompensation, outputSrgb ? 1 : 0};
+
+  etna::RenderTargetState target(cmd, {{0, 0}, {resolution.x, resolution.y}},
+    {{.image = output, .view = view}}, {});
+  cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, postPipeline.getVkPipeline());
+  cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, postPipeline.getVkPipelineLayout(),
+    0, {postSet.getVkSet()}, {});
+  cmd.pushConstants<PostSettings>(postPipeline.getVkPipelineLayout(),
+    vk::ShaderStageFlagBits::eFragment, 0, {postSettings});
+  cmd.draw(3, 1, 0, 0);
 }

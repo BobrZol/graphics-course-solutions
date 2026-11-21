@@ -19,6 +19,8 @@ target_add_shaders(terrain
   shaders/rocks.vert
   shaders/rocks.frag
   shaders/rocks.comp
+  shaders/exposure.comp
+  shaders/post.frag
   shaders/sky.frag
   shaders/lighting.frag
   shaders/decals.frag
