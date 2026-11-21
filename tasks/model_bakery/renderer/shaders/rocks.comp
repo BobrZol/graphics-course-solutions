@@ -1,0 +1,153 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+struct Instance
+{
+  mat4 transform;
+  vec4 color;
+};
+
+struct DrawCommand
+{
+  uint indexCount;
+  uint instanceCount;
+  uint firstIndex;
+  int vertexOffset;
+  uint firstInstance;
+};
+
+layout(std430, set = 0, binding = 0) writeonly buffer Instances
+{
+  Instance instances[];
+};
+
+layout(std430, set = 0, binding = 1) buffer Commands
+{
+  DrawCommand commands[];
+};
+
+layout(set = 0, binding = 2) uniform sampler2D heightmap;
+
+layout(std140, set = 0, binding = 3) uniform Parameters
+{
+  vec4 planes[6];
+  vec4 cameraDistance;
+  vec4 terrainDensity;
+  vec4 sizes;
+  vec4 bounds[2];
+  ivec4 cells;
+} params;
+
+uint hash(uint value)
+{
+  value = (value ^ (value >> 16)) * 2246822519u;
+  value = (value ^ (value >> 13)) * 3266489917u;
+  return value ^ (value >> 16);
+}
+
+float random(uint seed, uint channel)
+{
+  return float(hash(seed ^ (channel * 1597334677u)) >> 8) / 16777216.0;
+}
+
+float texelHeight(vec2 p)
+{
+  p *= 1023.0 / 256.0;
+  ivec2 cell = ivec2(floor(p));
+  vec2 f = fract(p);
+  int x = min(cell.x + 1, 1023);
+  int z = min(cell.y + 1, 1023);
+
+  return mix(
+    mix(texelFetch(heightmap, cell, 0).r, texelFetch(heightmap, ivec2(x, cell.y), 0).r, f.x),
+    mix(texelFetch(heightmap, ivec2(cell.x, z), 0).r, texelFetch(heightmap, ivec2(x, z), 0).r, f.x), f.y);
+}
+
+float sampleHeight(vec2 grid, out vec2 slope)
+{
+  vec2 cell = min(floor(grid), vec2(255));
+  vec2 f = grid - cell;
+  float b = texelHeight(cell + vec2(1, 0));
+  float c = texelHeight(cell + vec2(0, 1));
+
+  if (f.x + f.y <= 1.0)
+  {
+    float a = texelHeight(cell);
+    slope = vec2(b - a, c - a);
+    return a * (1.0 - f.x - f.y) + b * f.x + c * f.y;
+  }
+
+  float d = texelHeight(cell + vec2(1));
+  slope = vec2(d - c, d - b);
+  return d * (f.x + f.y - 1.0) + b * (1.0 - f.y) + c * (1.0 - f.x);
+}
+
+vec4 multiplyQuaternion(vec4 a, vec4 b)
+{
+  return vec4(a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz), a.w * b.w - dot(a.xyz, b.xyz));
+}
+
+vec3 rotateQuaternion(vec4 q, vec3 p)
+{
+  return p + 2.0 * cross(q.xyz, cross(q.xyz, p) + q.w * p);
+}
+
+void main()
+{
+  uint id = gl_GlobalInvocationID.x;
+  uint count = uint(params.cells.z * params.cells.w * 4);
+  if (id >= count)
+    return;
+
+  uint candidate = id % 4;
+  uint cellIndex = id / 4;
+  uint x = uint(params.cells.x) + cellIndex % uint(params.cells.z);
+  uint z = uint(params.cells.y) + cellIndex / uint(params.cells.z);
+  uint seed = hash(x * 73856093u ^ z * 19349663u ^ candidate * 83492791u ^ 42u);
+  if (random(seed, 0) >= params.terrainDensity.z)
+    return;
+
+  vec2 point = (vec2(x, z) + vec2(random(seed, 1), random(seed, 2))) * 2.0 - params.terrainDensity.x * 0.5;
+  vec2 delta = point - params.cameraDistance.xz;
+  if (dot(delta, delta) > params.terrainDensity.w * params.terrainDensity.w)
+    return;
+
+  vec2 slope;
+  float height = sampleHeight((point / params.terrainDensity.x + 0.5) * 256.0, slope);
+  float probability = mix(0.05, 1.0, smoothstep(0.025, 0.15, height)) *
+    mix(1.0, 0.05, smoothstep(0.4, 0.58, height));
+  if (height <= 0.01 || random(seed, 3) >= probability)
+    return;
+
+  uint model = hash(seed ^ 0x9e3779b9u) % 2;
+  float scale = mix(params.sizes.x, params.sizes.y, random(seed, 4));
+  float angle = random(seed, 5) * 6.28318530718;
+
+  slope *= params.terrainDensity.y * 256.0 / params.terrainDensity.x;
+  vec3 normal = normalize(vec3(-slope.x, 1, -slope.y));
+  vec4 tilt = normalize(vec4(normal.z, 0, -normal.x, 1.0 + normal.y));
+  vec4 rotation = multiplyQuaternion(tilt, vec4(0, sin(angle * 0.5), 0, cos(angle * 0.5)));
+
+  vec3 position = vec3(point.x, height * params.terrainDensity.y, point.y) - normal * (scale * 0.12);
+  vec3 center = position + rotateQuaternion(rotation, params.bounds[model].xyz * scale);
+  float radius = params.bounds[model].w * scale;
+  if (distance(center, params.cameraDistance.xyz) > params.cameraDistance.w + radius)
+    return;
+
+  for (int i = 0; i < 6; ++i)
+    if (dot(params.planes[i].xyz, center) + params.planes[i].w < -radius)
+      return;
+
+  uint slot = atomicAdd(commands[model].instanceCount, 1);
+  uint outputIndex = model * 65536 + slot;
+
+  instances[outputIndex].transform = mat4(
+    vec4(rotateQuaternion(rotation, vec3(scale, 0, 0)), 0),
+    vec4(rotateQuaternion(rotation, vec3(0, scale, 0)), 0),
+    vec4(rotateQuaternion(rotation, vec3(0, 0, scale)), 0),
+    vec4(position, 1));
+
+  instances[outputIndex].color = vec4(mix(0.85, 1.15, random(seed, 6)) *
+    vec3(1.0, mix(0.95, 1.05, random(seed, 7)), mix(0.93, 1.05, random(seed, 8))), 1);
+}

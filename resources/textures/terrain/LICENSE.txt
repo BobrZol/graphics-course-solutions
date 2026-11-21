@@ -1,0 +1,10 @@
+Poly Haven textures, CC0 1.0 Universal.
+https://polyhaven.com/license
+https://creativecommons.org/publicdomain/zero/1.0/
+
+sand_03: https://polyhaven.com/a/sand_03
+sparse_grass: https://polyhaven.com/a/sparse_grass
+rock_06: https://polyhaven.com/a/rock_06
+snow_01: https://polyhaven.com/a/snow_01
+
+Albedo (diff), roughness (rough), height (disp), original 1K JPEG files.

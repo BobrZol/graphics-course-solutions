@@ -1,0 +1,107 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D hdr;
+layout(set = 0, binding = 1, std430) buffer Statistics
+{
+  uint minimum;
+  uint maximum;
+  uint bins[100];
+  float exposure;
+} stats;
+
+layout(push_constant) uniform Settings
+{
+  int phase;
+  int useShared;
+  float dt;
+  float compensation;
+} settings;
+
+shared uint localBins[100];
+shared uint localMin;
+shared uint localMax;
+
+void main()
+{
+  uint lane = gl_LocalInvocationIndex;
+
+  if (settings.phase == 2)
+  {
+    if (gl_GlobalInvocationID != uvec3(0))
+      return;
+
+    uint total = 0;
+    float sum = 0;
+    float lo = log2(max(uintBitsToFloat(stats.minimum), 0.00001));
+    float hi = log2(max(uintBitsToFloat(stats.maximum), 0.00001));
+
+    for (int i = 0; i < 100; ++i)
+    {
+      total += stats.bins[i];
+      sum += float(stats.bins[i]) * mix(lo, hi, (float(i) + 0.5) / 100.0);
+    }
+
+    float target = clamp(0.18 / exp2(sum / max(float(total), 1.0)), 0.01, 64.0);
+    stats.exposure = stats.exposure <= 0 ? target :
+      mix(stats.exposure, target, 1.0 - exp(-settings.dt * 2.0));
+    return;
+  }
+
+  if (lane == 0)
+  {
+    localMin = floatBitsToUint(3.402823e38);
+    localMax = 0;
+  }
+
+  if (lane < 100)
+    localBins[lane] = 0;
+
+  barrier();
+
+  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+
+  if (all(lessThan(pixel, textureSize(hdr, 0))))
+  {
+    float luminance = max(dot(texelFetch(hdr, pixel, 0).rgb, vec3(0.2126, 0.7152, 0.0722)), 0.00001);
+
+    if (settings.phase == 0)
+    {
+      if (settings.useShared != 0)
+      {
+        atomicMin(localMin, floatBitsToUint(luminance));
+        atomicMax(localMax, floatBitsToUint(luminance));
+      }
+      else
+      {
+        atomicMin(stats.minimum, floatBitsToUint(luminance));
+        atomicMax(stats.maximum, floatBitsToUint(luminance));
+      }
+    }
+    else
+    {
+      float lo = log2(uintBitsToFloat(stats.minimum));
+      float hi = log2(uintBitsToFloat(stats.maximum));
+      uint bin = uint(clamp((log2(luminance) - lo) / max(hi - lo, 0.00001) * 100.0, 0.0, 99.0));
+
+      if (settings.useShared != 0)
+        atomicAdd(localBins[bin], 1);
+      else
+        atomicAdd(stats.bins[bin], 1);
+    }
+  }
+
+  barrier();
+
+  if (settings.useShared != 0)
+  {
+    if (settings.phase == 0 && lane == 0)
+    {
+      atomicMin(stats.minimum, localMin);
+      atomicMax(stats.maximum, localMax);
+    }
+
+    if (settings.phase == 1 && lane < 100)
+      atomicAdd(stats.bins[lane], localBins[lane]);
+  }
+}

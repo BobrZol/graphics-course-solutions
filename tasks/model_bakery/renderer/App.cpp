@@ -1,6 +1,9 @@
 #include "App.hpp"
 
 #include <tracy/Tracy.hpp>
+#include <imgui.h>
+#include <algorithm>
+#include <cstdlib>
 
 
 App::App()
@@ -19,9 +22,10 @@ App::App()
 
   renderer->initFrameDelivery(std::move(surface), [this]() { return mainWindow->getResolution(); });
 
-  mainCam.lookAt({0, 10, 10}, {0, 0, 0}, {0, 1, 0});
-
-  renderer->loadScene(GRAPHICS_COURSE_RESOURCES_ROOT "/scenes/low_poly_dark_town/scene.gltf");
+  ImGuiRenderer::enableImGuiForWindow(mainWindow->native());
+  mainCam.lookAt({85, 55, 95}, {0, 15, 0}, {0, 1, 0});
+  mainCam.zNear = 0.1f;
+  mainCam.zFar = 2000;
 }
 
 void App::run()
@@ -35,9 +39,13 @@ void App::run()
 
     windowing.poll();
 
-    processInput(diffTime);
+    if (std::getenv("ROCK_BENCHMARK") == nullptr &&
+        std::getenv("DEFERRED_BENCHMARK") == nullptr)
+      processInput(std::min(diffTime, 0.1f));
 
     drawFrame();
+    if (renderer->isBenchmarkDone())
+      mainWindow->askToClose();
 
     FrameMark;
   }
@@ -51,14 +59,16 @@ void App::processInput(float dt)
     mainWindow->askToClose();
 
   if (is_held_down(mainWindow->keyboard[KeyboardKey::kLeftShift]))
-    camMoveSpeed = 10;
+    camMoveSpeed = 100;
   else
-    camMoveSpeed = 1;
+    camMoveSpeed = 25;
 
-  if (mainWindow->mouse[MouseButton::mbRight] == ButtonState::Rising)
+  if (!ImGui::GetIO().WantCaptureMouse &&
+      mainWindow->mouse[MouseButton::mbRight] == ButtonState::Rising)
     mainWindow->captureMouse = !mainWindow->captureMouse;
 
-  moveCam(mainCam, mainWindow->keyboard, dt);
+  if (!ImGui::GetIO().WantCaptureKeyboard)
+    moveCam(mainCam, mainWindow->keyboard, dt);
   if (mainWindow->captureMouse)
     rotateCam(mainCam, mainWindow->mouse, dt);
 
